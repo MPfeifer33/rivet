@@ -1,9 +1,40 @@
 use std::path::Path;
+use std::sync::LazyLock;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use crate::diff::DiffData;
 use crate::RivetError;
+
+// --- Sentinel integration types ---
+
+#[derive(Debug, Deserialize)]
+struct SentinelMatrix {
+    files: Vec<SentinelFileRisk>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SentinelFileRisk {
+    path: String,
+    risk_score: u32,
+    level: String,
+    bugfix_commits: usize,
+    reasons: Vec<String>,
+}
+
+// --- Keystone integration types ---
+
+#[derive(Debug, Deserialize)]
+struct KeystoneContract {
+    #[serde(default)]
+    protected: Vec<KeystoneProtected>,
+}
+
+#[derive(Debug, Deserialize)]
+struct KeystoneProtected {
+    pattern: String,
+    reason: String,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Finding {
@@ -26,6 +57,8 @@ pub fn run_all_checks(
     findings.extend(check_large_diff(diff));
     findings.extend(check_missing_tests(repo, diff));
     findings.extend(check_risky_files(diff));
+    findings.extend(check_sentinel_risk(repo, diff));
+    findings.extend(check_keystone_protected(repo, diff));
     findings.extend(check_formatting_only(diff));
     findings.extend(check_todo_fixme(diff));
 
@@ -36,23 +69,22 @@ pub fn run_all_checks(
     Ok(findings)
 }
 
-fn check_secrets(diff: &DiffData) -> Vec<Finding> {
-    let patterns = [
-        (r#"(?i)(api[_-]?key|apikey)\s*[:=]\s*['"][^'"]{8,}"#, "API key"),
-        (r#"(?i)(secret|password|passwd|pwd)\s*[:=]\s*['"][^'"]{8,}"#, "Secret/password"),
-        (r"(?i)bearer\s+[a-zA-Z0-9\-._~+/]{20,}", "Bearer token"),
-        (r"ghp_[a-zA-Z0-9]{36}", "GitHub personal access token"),
-        (r"sk-[a-zA-Z0-9]{20,}", "API secret key"),
-        (r"-----BEGIN (RSA |EC |DSA )?PRIVATE KEY-----", "Private key"),
-        (r#"(?i)aws[_-]?secret[_-]?access[_-]?key\s*[:=]\s*['"]?[A-Za-z0-9/+=]{40}"#, "AWS secret"),
-    ];
+static SECRET_PATTERNS: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| vec![
+    (Regex::new(r#"(?i)(api[_-]?key|apikey)\s*[:=]\s*['"][^'"]{8,}"#).unwrap(), "API key"),
+    (Regex::new(r#"(?i)(secret|password|passwd|pwd)\s*[:=]\s*['"][^'"]{8,}"#).unwrap(), "Secret/password"),
+    (Regex::new(r"(?i)bearer\s+[a-zA-Z0-9\-._~+/]{20,}").unwrap(), "Bearer token"),
+    (Regex::new(r"ghp_[a-zA-Z0-9]{36}").unwrap(), "GitHub personal access token"),
+    (Regex::new(r"sk-[a-zA-Z0-9]{20,}").unwrap(), "API secret key"),
+    (Regex::new(r"-----BEGIN (RSA |EC |DSA )?PRIVATE KEY-----").unwrap(), "Private key"),
+    (Regex::new(r#"(?i)aws[_-]?secret[_-]?access[_-]?key\s*[:=]\s*['"]?[A-Za-z0-9/+=]{40}"#).unwrap(), "AWS secret"),
+]);
 
+fn check_secrets(diff: &DiffData) -> Vec<Finding> {
     let mut findings = Vec::new();
 
     for file in &diff.files {
         for line in &file.added_lines {
-            for (pattern, name) in &patterns {
-                let re = Regex::new(pattern).unwrap();
+            for (re, name) in SECRET_PATTERNS.iter() {
                 if re.is_match(line) {
                     findings.push(Finding {
                         check: "secret_detected".into(),
@@ -221,8 +253,10 @@ fn check_formatting_only(diff: &DiffData) -> Vec<Finding> {
     findings
 }
 
+static TODO_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\b(TODO|FIXME|HACK|XXX|TEMP)\b").unwrap());
+
 fn check_todo_fixme(diff: &DiffData) -> Vec<Finding> {
-    let re = Regex::new(r"(?i)\b(TODO|FIXME|HACK|XXX|TEMP)\b").unwrap();
+    let re = &*TODO_RE;
     let mut findings = Vec::new();
 
     for file in &diff.files {
@@ -305,6 +339,112 @@ fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
-        format!("{}...", &s[..max])
+        let end = s.char_indices()
+            .take_while(|(i, _)| *i < max)
+            .last()
+            .map(|(i, c)| i + c.len_utf8())
+            .unwrap_or(0);
+        format!("{}...", &s[..end])
     }
+}
+
+// --- Sentinel risk check ---
+
+fn load_sentinel_matrix(repo: &Path) -> Option<SentinelMatrix> {
+    let path = repo.join(".agent-sentinel").join("matrix.json");
+    let content = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+fn check_sentinel_risk(repo: &Path, diff: &DiffData) -> Vec<Finding> {
+    let mut findings = Vec::new();
+
+    let matrix = match load_sentinel_matrix(repo) {
+        Some(m) => m,
+        None => return findings,
+    };
+
+    for file in &diff.files {
+        if let Some(risk) = matrix.files.iter().find(|f| f.path == file.path) {
+            if risk.level == "high" {
+                findings.push(Finding {
+                    check: "sentinel_high_risk".into(),
+                    severity: "error".into(),
+                    file: Some(file.path.clone()),
+                    line: None,
+                    message: format!(
+                        "Sentinel risk score {} ({} bugfix commits) — {}",
+                        risk.risk_score, risk.bugfix_commits,
+                        risk.reasons.first().map(|s| s.as_str()).unwrap_or("historically fragile")
+                    ),
+                });
+            } else if risk.level == "medium" {
+                findings.push(Finding {
+                    check: "sentinel_medium_risk".into(),
+                    severity: "warning".into(),
+                    file: Some(file.path.clone()),
+                    line: None,
+                    message: format!(
+                        "Sentinel risk score {} — verify test coverage",
+                        risk.risk_score
+                    ),
+                });
+            }
+        }
+    }
+
+    findings
+}
+
+// --- Keystone protected-zone check ---
+
+fn load_keystone_contract(repo: &Path) -> Option<KeystoneContract> {
+    let path = repo.join(".agent-contract.toml");
+    let content = std::fs::read_to_string(path).ok()?;
+    toml::from_str(&content).ok()
+}
+
+fn matches_keystone_pattern(path: &str, pattern: &str) -> bool {
+    if pattern.ends_with("/**") {
+        let prefix = &pattern[..pattern.len() - 3];
+        path == prefix || path.starts_with(&format!("{prefix}/"))
+    } else if pattern.contains('*') {
+        static GLOB_DOT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\.").unwrap());
+        static GLOB_STAR: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\*").unwrap());
+        let escaped = GLOB_DOT.replace_all(pattern, r"\.");
+        let regex_pattern = GLOB_STAR.replace_all(&escaped, ".*");
+        Regex::new(&format!("^{regex_pattern}$"))
+            .map(|re| re.is_match(path))
+            .unwrap_or(false)
+    } else {
+        path == pattern
+    }
+}
+
+fn check_keystone_protected(repo: &Path, diff: &DiffData) -> Vec<Finding> {
+    let mut findings = Vec::new();
+
+    let contract = match load_keystone_contract(repo) {
+        Some(c) => c,
+        None => return findings,
+    };
+
+    for file in &diff.files {
+        for protected in &contract.protected {
+            if matches_keystone_pattern(&file.path, &protected.pattern) {
+                findings.push(Finding {
+                    check: "keystone_protected".into(),
+                    severity: "warning".into(),
+                    file: Some(file.path.clone()),
+                    line: None,
+                    message: format!(
+                        "Protected zone `{}` — {}",
+                        protected.pattern, protected.reason
+                    ),
+                });
+            }
+        }
+    }
+
+    findings
 }
