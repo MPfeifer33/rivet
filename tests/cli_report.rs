@@ -192,3 +192,58 @@ fn untracked_test_files_count_as_test_changes() {
         .iter()
         .any(|finding| finding["check"] == "missing_tests"));
 }
+
+#[test]
+fn temp_variable_name_is_not_todo_marker() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    init_repo(dir);
+
+    fs::write(
+        dir.join("src/lib.rs"),
+        "pub fn value() -> u8 { let temp = 5; temp }\n",
+    )
+    .unwrap();
+
+    let json = json_output(
+        rivet(dir)
+            .args(["--format", "json", "check"])
+            .output()
+            .unwrap(),
+        "rivet check json",
+    );
+
+    assert!(!json["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|finding| finding["check"] == "todo_added"));
+}
+
+#[test]
+fn temp_comment_is_todo_marker() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    init_repo(dir);
+
+    let temp_marker = format!("{} TEMP: remove after migration", "//");
+    fs::write(
+        dir.join("src/lib.rs"),
+        format!("pub fn value() -> u8 {{ 5 }}\n{temp_marker}\n"),
+    )
+    .unwrap();
+
+    let json = json_output(
+        rivet(dir)
+            .args(["--format", "json", "check"])
+            .output()
+            .unwrap(),
+        "rivet check json",
+    );
+
+    assert!(json["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|finding| finding["check"] == "todo_added"));
+}

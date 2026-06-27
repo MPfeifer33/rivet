@@ -253,7 +253,8 @@ fn check_formatting_only(diff: &DiffData) -> Vec<Finding> {
     findings
 }
 
-static TODO_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\b(TODO|FIXME|HACK|XXX|TEMP)\b").unwrap());
+static TODO_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)(?://|#|/\*|\*)\s*(TODO|FIXME|HACK|XXX|TEMP)\b").unwrap());
 
 fn check_todo_fixme(diff: &DiffData) -> Vec<Finding> {
     let re = &*TODO_RE;
